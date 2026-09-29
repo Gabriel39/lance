@@ -10434,7 +10434,7 @@ mod tests {
                 "vector",
                 array::rand_vec::<arrow_array::types::Float32Type>(8.into()),
             )
-            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+            .into_reader_rows(RowCount::from(10), BatchCount::from(2));
 
         let mut dataset = Dataset::write(
             reader,
@@ -10448,32 +10448,29 @@ mod tests {
         .await
         .unwrap();
 
-        let field_id = dataset.schema().field("vector").unwrap().id;
-        let seg0 = write_vector_segment_metadata(
-            &dataset,
-            "vector_idx",
-            field_id,
-            Uuid::new_v4(),
-            [0_u32],
-            b"seg0",
-        )
-        .await;
-        let seg1 = write_vector_segment_metadata(
-            &dataset,
-            "vector_idx",
-            field_id,
-            Uuid::new_v4(),
-            [1_u32],
-            b"seg1",
-        )
-        .await;
-
+        // Commit validation opens coexisting vector segments, so this fixture must
+        // contain real index files rather than placeholder metadata payloads.
+        let fragments = dataset.get_fragments();
+        assert_eq!(fragments.len(), 2);
+        let params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+        let mut segments = Vec::with_capacity(fragments.len());
+        for fragment in &fragments {
+            segments.push(
+                dataset
+                    .create_index_builder(&["vector"], IndexType::Vector, &params)
+                    .name("vector_idx".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        let expected_uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<HashSet<_>>();
         dataset
-            .commit_existing_index_segments(
-                "vector_idx",
-                "vector",
-                vec![segment_from_metadata(&seg0), segment_from_metadata(&seg1)],
-            )
+            .commit_existing_index_segments("vector_idx", "vector", segments)
             .await
             .unwrap();
 
@@ -10481,8 +10478,7 @@ mod tests {
         assert_eq!(committed.len(), 2);
         let committed_uuids = committed.iter().map(|idx| idx.uuid).collect::<HashSet<_>>();
         assert_eq!(
-            committed_uuids,
-            HashSet::from([seg0.uuid, seg1.uuid]),
+            committed_uuids, expected_uuids,
             "all committed segment uuids should be preserved"
         );
         assert_eq!(
