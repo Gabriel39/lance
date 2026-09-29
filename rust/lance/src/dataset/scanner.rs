@@ -6408,7 +6408,7 @@ impl Scanner {
             let mut batch_query = q.clone();
             batch_query.metric_type = Some(index_metric);
             let prefilter_source = self
-                .prefilter_source(filter_plan, self.get_indexed_frags(index_segments))
+                .ann_prefilter_source(filter_plan, index_segments)
                 .await?;
             return new_knn_batch_exec(
                 self.dataset.clone(),
@@ -7504,6 +7504,31 @@ impl Scanner {
         all_indexed_frags & all_fragments
     }
 
+    async fn ann_prefilter_source(
+        &self,
+        filter_plan: &ExprFilterPlan,
+        indices: &[IndexMetadata],
+    ) -> Result<PreFilterSource> {
+        if filter_plan.is_empty() && !indices.is_empty() {
+            let excluded_fragments =
+                self.dataset.fragment_bitmap.as_ref() - &self.get_fragments_as_bitmap();
+            // Compare raw segment coverage: get_indexed_frags already intersects the scan
+            // scope and would hide excluded candidates. DatasetPreFilter still enforces
+            // deletions and segment visibility, while ANN retains overlay/external masks.
+            let has_full_index_coverage = indices.iter().all(|index| {
+                index
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|fragments| fragments.is_disjoint(&excluded_fragments))
+            });
+            if has_full_index_coverage {
+                return Ok(PreFilterSource::None);
+            }
+        }
+        self.prefilter_source(filter_plan, self.get_indexed_frags(indices))
+            .await
+    }
+
     /// Create an Execution plan to do indexed ANN search
     async fn ann(
         &self,
@@ -7512,9 +7537,7 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         overlay_block: Option<RowAddrMask>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let prefilter_source = self
-            .prefilter_source(filter_plan, self.get_indexed_frags(index))
-            .await?;
+        let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
         let inner_fanout_search = new_knn_exec(
             self.dataset.clone(),
             index,
@@ -7557,9 +7580,7 @@ impl Scanner {
 
         let over_fetch_factor = *DEFAULT_XTR_OVERFETCH;
 
-        let prefilter_source = self
-            .prefilter_source(filter_plan, self.get_indexed_frags(index))
-            .await?;
+        let prefilter_source = self.ann_prefilter_source(filter_plan, index).await?;
         let dim = get_vector_dim(self.dataset.schema(), &q.column)?;
 
         let num_queries = q.key.len() / dim;
@@ -18665,6 +18686,99 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
         }
         assert_eq!(get_default_io_buffer_size_override(), None);
+    }
+
+    #[rstest]
+    #[case::covered(vec![Some(vec![0])], true)]
+    #[case::partial(vec![Some(vec![0, 1])], false)]
+    #[case::removed_fragment(vec![Some(vec![0, 100])], true)]
+    #[case::unknown(vec![None], false)]
+    #[case::mixed_unknown(vec![Some(vec![0]), None], false)]
+    #[case::multiple_segments(vec![Some(vec![0]), Some(vec![1])], false)]
+    #[tokio::test]
+    async fn test_segment_prefilter_coverage(
+        #[case] coverage: Vec<Option<Vec<u32>>>,
+        #[case] no_prefilter: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        test_ds.make_vector_index().await.unwrap();
+        let metadata = test_ds.dataset.load_indices().await.unwrap();
+        let indices: Vec<_> = coverage
+            .into_iter()
+            .map(|fragments| {
+                let mut index = metadata[0].clone();
+                index.fragment_bitmap = fragments.map(|ids| ids.into_iter().collect());
+                index
+            })
+            .collect();
+        let mut scanner = test_ds.dataset.scan();
+        scanner.with_fragments(vec![test_ds.dataset.manifest.fragments[0].clone()]);
+        let source = scanner
+            .ann_prefilter_source(&ExprFilterPlan::default(), &indices)
+            .await
+            .unwrap();
+        assert_eq!(matches!(source, PreFilterSource::None), no_prefilter);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_segment_prefilter_execution(
+        #[values(false, true)] segmented: bool,
+        #[values(false, true)] stable_row_ids: bool,
+        #[values(false, true)] filtered: bool,
+    ) {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
+            .await
+            .unwrap();
+        let segments = if segmented {
+            test_ds.make_segmented_vector_index().await.unwrap()
+        } else {
+            test_ds.make_vector_index().await.unwrap();
+            vec![test_ds.dataset.load_indices().await.unwrap()[0].uuid]
+        };
+        test_ds.dataset.delete("i = 7").await.unwrap();
+        test_ds.append_new_data().await.unwrap();
+        let fragments = test_ds.dataset.manifest.fragments.clone();
+        let stats = Arc::new(Mutex::new(None));
+        let collected = stats.clone();
+        let mut scanner = test_ds.dataset.scan();
+        scanner
+            .prefilter(true)
+            .with_fragments(vec![fragments[0].clone(), fragments[2].clone()])
+            .with_index_segments(vec![segments[0]])
+            .unwrap()
+            .scan_stats_callback(Arc::new(move |summary| {
+                *collected.lock().unwrap() = Some(summary.clone());
+            }));
+        scanner
+            .nearest("vec", &Float32Array::from(vec![0.0; 32]), 500)
+            .unwrap();
+        scanner.nprobes(2);
+        if filtered {
+            scanner.filter("i >= 100").unwrap();
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        let actual: BTreeSet<i32> = batch["i"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        let expected: BTreeSet<i32> = (0..200)
+            .chain(400..410)
+            .filter(|i| *i != 7 && (!filtered || *i >= 100))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(batch.num_rows(), expected.len());
+        let summary = stats.lock().unwrap().take().unwrap();
+        let loads = summary
+            .all_counts
+            .get("prefilter_loads")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(loads, if filtered || !segmented { 1 } else { 0 });
     }
 
     #[rstest]
