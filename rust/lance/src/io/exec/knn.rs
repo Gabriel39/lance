@@ -5050,6 +5050,7 @@ mod tests {
             for name in [
                 "ANNSubIndexExec_elapsed_compute",
                 "index_partition_load_time",
+                "index_partition_prepare_time",
                 "index_cpu_queue_wait_time",
                 "index_search_time",
                 "index_query_prepare_time",
@@ -5062,6 +5063,71 @@ mod tests {
                     stats.all_times
                 );
             }
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_partition_prepare_metrics_cold_vs_warm(#[values(false, true)] is_prepared: bool) {
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let indices = fixture.dataset.load_indices().await.unwrap();
+        let index = fixture
+            .dataset
+            .open_vector_index(
+                "vector",
+                &indices[0].uuid,
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        let query = Query {
+            column: "vector".to_owned(),
+            key: fixture.get_centroid(0),
+            ..base_query()
+        };
+        let mut previous = None;
+        for is_warm in [false, true] {
+            let metrics = ExecutionPlanMetricsSet::new();
+            let collector = IndexMetrics::new(&metrics, 0);
+            let prefilter = Arc::new(lance_index::prefilter::NoFilter);
+            // Call both entry points directly so CPU/session limits cannot silently
+            // turn the parallel-path regression into another sequential search.
+            let batch = if is_prepared {
+                let handle = index
+                    .prepare_partition_search(0, &query, prefilter, &collector)
+                    .await
+                    .unwrap();
+                index.search_prepared_partition(handle, &collector).unwrap()
+            } else {
+                index
+                    .search_in_partition(0, &query, prefilter, &collector)
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(batch.num_rows(), query.k);
+            if let Some(previous) = &previous {
+                assert_eq!(&batch, previous);
+            }
+            previous = Some(batch);
+            let timings = metrics.clone_inner();
+            let prepare = timings
+                .sum_by_name("index_partition_prepare_time")
+                .unwrap()
+                .as_usize();
+            let load = timings
+                .sum_by_name("index_partition_load_time")
+                .unwrap()
+                .as_usize();
+            assert!(
+                prepare > 0,
+                "missing preparation time: prepared={is_prepared}, warm={is_warm}"
+            );
+            // DataFusion rounds zero-duration updates up to 1ns, so positivity
+            // alone cannot detect a missing preparation timer.
+            assert!(
+                prepare >= load,
+                "preparation must include partition loading"
+            );
         }
     }
 

@@ -2198,14 +2198,23 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        {
-            let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
-            pre_filter.wait_for_ready().await?;
-        }
-        let pre_filter =
-            Self::prefilter_for_partition(&self.index_cache, partition_id, &part_entry, pre_filter)
-                .await?;
+        let (part_entry, pre_filter) = {
+            // Match split preparation without counting CPU queueing or search.
+            let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
+            let part_entry = self.load_partition(partition_id, true, metrics).await?;
+            {
+                let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await?;
+            }
+            let pre_filter = Self::prefilter_for_partition(
+                &self.index_cache,
+                partition_id,
+                &part_entry,
+                pre_filter,
+            )
+            .await?;
+            (part_entry, pre_filter)
+        };
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
