@@ -7504,6 +7504,19 @@ impl Scanner {
         all_indexed_frags & all_fragments
     }
 
+    /// Choose the prefilter source for an indexed ANN scan.
+    ///
+    /// Skip the row-ID allow-list when there is no predicate and every selected
+    /// segment has known coverage with no currently visible fragment outside the
+    /// scan scope. The scope cannot reject an indexed row in that case.
+    /// `DatasetPreFilter` still enforces deletions and missing fragments, while
+    /// ANN retains overlay and external masks.
+    ///
+    /// Check the segments' raw bitmaps: [`Self::get_indexed_frags`] intersects
+    /// coverage with the scan scope and would hide excluded fragments. Obsolete
+    /// fragment IDs do not block this optimization because they are not visible
+    /// in the current snapshot. Predicates, unknown coverage, partial coverage,
+    /// and an empty segment list fall back to [`Self::prefilter_source`].
     async fn ann_prefilter_source(
         &self,
         filter_plan: &ExprFilterPlan,
@@ -7512,9 +7525,6 @@ impl Scanner {
         if filter_plan.is_empty() && !indices.is_empty() {
             let excluded_fragments =
                 self.dataset.fragment_bitmap.as_ref() - &self.get_fragments_as_bitmap();
-            // Compare raw segment coverage: get_indexed_frags already intersects the scan
-            // scope and would hide excluded candidates. DatasetPreFilter still enforces
-            // deletions and segment visibility, while ANN retains overlay/external masks.
             let has_full_index_coverage = indices.iter().all(|index| {
                 index
                     .fragment_bitmap
@@ -18728,6 +18738,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
         #[values(false, true)] segmented: bool,
         #[values(false, true)] stable_row_ids: bool,
         #[values(false, true)] filtered: bool,
+        #[values(false, true)] has_unindexed: bool,
     ) {
         let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, stable_row_ids)
             .await
@@ -18738,15 +18749,35 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             test_ds.make_vector_index().await.unwrap();
             vec![test_ds.dataset.load_indices().await.unwrap()[0].uuid]
         };
+        let indices = test_ds.dataset.load_indices().await.unwrap();
+        let selected_segment = indices
+            .iter()
+            .find(|index| index.uuid == segments[0])
+            .unwrap();
+        // The unsegmented index spans both fragments; selecting only fragment 0 must
+        // retain the prefilter even without a predicate or unindexed fallback.
+        let expected_coverage: RoaringBitmap = if segmented { vec![0] } else { vec![0, 1] }
+            .into_iter()
+            .collect();
+        assert_eq!(
+            selected_segment.fragment_bitmap.as_ref(),
+            Some(&expected_coverage)
+        );
         test_ds.dataset.delete("i = 7").await.unwrap();
-        test_ds.append_new_data().await.unwrap();
+        if has_unindexed {
+            test_ds.append_new_data().await.unwrap();
+        }
         let fragments = test_ds.dataset.manifest.fragments.clone();
+        let mut scope = vec![fragments[0].clone()];
+        if has_unindexed {
+            scope.push(fragments[2].clone());
+        }
         let stats = Arc::new(Mutex::new(None));
         let collected = stats.clone();
         let mut scanner = test_ds.dataset.scan();
         scanner
             .prefilter(true)
-            .with_fragments(vec![fragments[0].clone(), fragments[2].clone()])
+            .with_fragments(scope)
             .with_index_segments(vec![segments[0]])
             .unwrap()
             .scan_stats_callback(Arc::new(move |summary| {
@@ -18767,7 +18798,7 @@ full_filter=name LIKE Utf8(\"test%2\"), refine_filter=name LIKE Utf8(\"test%2\")
             .copied()
             .collect();
         let expected: BTreeSet<i32> = (0..200)
-            .chain(400..410)
+            .chain((400..410).filter(|_| has_unindexed))
             .filter(|i| *i != 7 && (!filtered || *i >= 100))
             .collect();
         assert_eq!(actual, expected);
