@@ -2452,6 +2452,28 @@ impl DatasetIndexExt for Dataset {
             .collect();
         validate_segment_params_compatible(&retained_indices, &new_indices)?;
 
+        // The query planner ranks coexisting vector segments under one contract.
+        // Validate after replacement selection so a full rebuild may change it.
+        let coexisting_indices = new_indices.iter().chain(retained_indices.iter());
+        let vector_segment_count = coexisting_indices
+            .clone()
+            .filter(|segment| segment_has_vector_details(segment))
+            .count();
+        if vector_segment_count > 1 {
+            let mut vector_indices = Vec::with_capacity(vector_segment_count);
+            for segment in coexisting_indices {
+                let index = self
+                    .open_vector_index_from_metadata(column, segment, &NoOpMetricsCollector)
+                    .await?;
+                vector_indices.push(index);
+            }
+            vector::ivf::validate_vector_query_compatibility(
+                &vector_indices,
+                &format!("CreateIndex: index '{index_name}'"),
+            )
+            .map_err(|error| Error::invalid_input(error.to_string()))?;
+        }
+
         let transaction = Transaction::new(
             self.manifest.version,
             Operation::CreateIndex {
@@ -3192,6 +3214,13 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
         uuid: &Uuid,
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>>;
+    /// Opens a built vector segment without requiring it to be committed to the manifest.
+    async fn open_vector_index_from_metadata(
+        &self,
+        column: &str,
+        index_meta: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>>;
     /// Opens all segments for one logical vector index and returns a materialized snapshot.
     async fn open_logical_vector_index(
         &self,
@@ -3340,8 +3369,19 @@ impl DatasetIndexInternalExt for Dataset {
             .load_index(uuid)
             .await?
             .ok_or_else(|| Error::index(format!("Index with id {} does not exist", uuid)))?;
-        let object_store = self.object_store_for_index(&index_meta).await?;
-        let resolved = frag_reuse::open_row_id_remapping(self, &index_meta, metrics).await?;
+        self.open_vector_index_from_metadata(column, &index_meta, metrics)
+            .await
+    }
+
+    async fn open_vector_index_from_metadata(
+        &self,
+        column: &str,
+        index_meta: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Arc<dyn VectorIndex>> {
+        let uuid = &index_meta.uuid;
+        let object_store = self.object_store_for_index(index_meta).await?;
+        let resolved = frag_reuse::open_row_id_remapping(self, index_meta, metrics).await?;
         // The index state (paths, model, quantizer metadata) and a legacy
         // whole-index entry embed no translated rows: they live in the plain
         // per-index namespace and stay warm across appends and unrelated
@@ -3384,7 +3424,7 @@ impl DatasetIndexInternalExt for Dataset {
         } else {
             self.open_frag_reuse_index(metrics).await?
         };
-        let index_dir = self.indice_files_dir(&index_meta)?;
+        let index_dir = self.indice_files_dir(index_meta)?;
         let index_file = index_dir
             .clone()
             .join(uuid.to_string())
@@ -3488,7 +3528,7 @@ impl DatasetIndexInternalExt for Dataset {
                     serde_json::from_str(index_metadata)?;
 
                 // Resolve the column name and field
-                let (field_path, field) = resolve_index_column(self.schema(), &index_meta, column)?;
+                let (field_path, field) = resolve_index_column(self.schema(), index_meta, column)?;
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
